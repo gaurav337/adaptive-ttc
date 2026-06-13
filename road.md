@@ -1,4 +1,4 @@
-# Learning Roadmap: Final Edition
+# Learning Roadmap: Final Edition (Updated)
 ## Learning Compute Allocation Policies from Execution Feedback
 
 Organized by the **order you build things**, not by topic.
@@ -107,6 +107,27 @@ This is literally Stage 1 of your pipeline.
 > Same 3,000 generations: **minutes, not days.**
 > Docs: https://docs.vllm.ai/en/latest/getting_started/quickstart.html#offline-batched-inference
 
+### DeepSeek-R1 specific setup
+
+DeepSeek-R1-Distill-Qwen-7B generates `<think>...</think>` blocks before code. From day one, write a parser that separates the two:
+
+```python
+import re
+
+def parse_deepseek_output(raw_output: str) -> dict:
+    think_match = re.search(r"<think>(.*?)</think>", raw_output, re.DOTALL)
+    think_text = think_match.group(1) if think_match else ""
+    code_text = re.sub(r"<think>.*?</think>", "", raw_output, flags=re.DOTALL).strip()
+    return {
+        "think_text": think_text,
+        "code_text": code_text,
+        "think_tokens": len(think_text.split()),   # approximate; use tokenizer for exact count
+        "code_tokens": len(code_text.split()),
+    }
+```
+
+Store `think_tokens` and `code_tokens` separately for every DeepSeek generation from the very first run. You will need this for the Phase 8 thinking token analysis, and retrofitting it later means re-running all generations.
+
 ---
 
 ## Phase 3: Set Up LiveCodeBench and Run Baselines
@@ -159,7 +180,7 @@ This gives you pass@1 scores out of the box. What you need to do next: study `lc
 
 **Mini-project:** Write `safe_execute(code_string, timeout=5)` using either E2B or Docker that returns:
 ```python
-{"status": "pass"} 
+{"status": "pass"}
 # or
 {"status": "fail", "exception_type": "TimeoutError", "traceback": "...", "runtime_ms": 4821}
 ```
@@ -167,9 +188,11 @@ This gives you pass@1 scores out of the box. What you need to do next: study `lc
 ---
 
 ## Phase 4: Build the Failure Signature Extractor
-**Duration: 1 week | Build: Stage 3**
+**Duration: 1–2 weeks | Build: Stage 3 — now includes semantic embeddings**
 
-### Tools to install and learn
+This phase is larger than the previous roadmap because you are building the combined tabular + embedding feature vector. This is the single biggest upgrade from the earlier version and the one that most affects classifier quality.
+
+### Part A — Tabular Features (same as before)
 
 **Radon — cyclomatic complexity and LOC:**
 ```bash
@@ -178,23 +201,27 @@ pip install radon
 - Docs: https://radon.readthedocs.io/en/latest/intro.html
 - You want `radon.complexity.cc_visit()` for cyclomatic complexity
 - And `radon.raw.analyze()` for lines of code, logical lines, blank lines
-- Article showing exact usage: https://medium.com/@commbigo/python-code-complexity-metrics-e6c87646c1c2
 
-**Python `ast` module — for AST node count:**
+**Python `ast` module — AST node count:**
 ```python
 import ast
 tree = ast.parse(code)
 ast_node_count = sum(1 for _ in ast.walk(tree))
 ```
 
-### Build the extractor
+**Error message keyword extraction:**
+```python
+import re
+last_line = traceback_str.strip().split('\n')[-1]
+keyword = last_line.split(':')[0].strip().lower().replace(' ', '_')
+# "keyerror", "indentationerror", "assertionerror", etc.
+```
+One-hot or label-encode the top 15 most common keywords in your dataset. This captures what went wrong semantically, not just structurally.
 
-Your function `extract_failure_signature(code, traceback_str, runtime_ms, problem_meta)` should return:
-
+Your tabular feature dict should look like:
 ```python
 {
-  # Execution features
-  "exception_type_syntaxerror": 1,   # one-hot encoded
+  "exception_type_syntaxerror": 1,
   "exception_type_timeouterror": 0,
   "exception_type_assertionerror": 0,
   "exception_type_valueerror": 0,
@@ -202,47 +229,115 @@ Your function `extract_failure_signature(code, traceback_str, runtime_ms, proble
   "exception_type_other": 0,
   "traceback_depth": 3,
   "runtime_ms": 4821,
-  "failure_line": 12,
-
-  # Code structure features
+  "failure_line_normalized": 0.5,
+  "is_timeout": 0,
   "token_count": 187,
   "lines_of_code": 24,
   "cyclomatic_complexity": 7,
   "ast_node_count": 143,
-
-  # Problem features
+  "has_recursion": 0,
+  "max_nesting_depth": 3,
   "prompt_length_tokens": 312,
   "difficulty_level": 2,
-
-  # NLP traceback feature (see upgrade below)
-  "error_msg_keyword": "key_error"
+  "error_msg_keyword": "assertionerror",
 }
 ```
 
-> **⚠️ UPGRADE — Extract the actual error message text, not just depth**
+### Part B — Semantic Embedding Features (new, required)
+
+This is what separates the current version from the earlier roadmap. Two `AssertionError` failures can look identical in tabular features but require completely different repair costs. Embeddings let the classifier read the actual content of the error.
+
+**What to learn first:**
+
+**3Blue1Brown — Neural Networks series (Chapters 1–3 only)**
+- https://www.youtube.com/playlist?list=PLZHQObOWTQDNU6R1_67000Dx_ZCJB-3pi
+- Understand what an embedding vector is and why similar inputs produce similar vectors.
+- Chapters 1–3 only. You do not need backprop for this project.
+
+**Hugging Face — Feature Extraction pipeline**
+- https://huggingface.co/docs/transformers/main_classes/pipelines#transformers.FeatureExtractionPipeline
+- 15 minutes. Shows you how to get a dense vector from any text.
+
+**Model to use — microsoft/codebert-base:**
+- https://huggingface.co/microsoft/codebert-base
+- 125M parameters, runs on any GPU with 4GB VRAM, produces 768-dimensional vectors
+- Pre-trained on code and natural language — designed exactly for code + traceback text
+
+**How to embed tracebacks and code:**
+```python
+from transformers import AutoTokenizer, AutoModel
+import torch
+
+tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+model = AutoModel.from_pretrained("microsoft/codebert-base")
+model.eval()  # freeze — never train this model
+
+def embed_text(text: str, max_length: int = 512) -> list[float]:
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length,
+        padding="max_length"
+    )
+    with torch.no_grad():
+        outputs = model(**inputs)
+    # Use [CLS] token embedding as the sentence vector
+    cls_vector = outputs.last_hidden_state[:, 0, :].squeeze().tolist()
+    return cls_vector  # 768-dimensional list of floats
+
+traceback_embedding = embed_text(traceback_str)   # 768 floats
+code_embedding = embed_text(failed_code)           # 768 floats
+```
+
+**Batching for speed:**
+```python
+def embed_batch(texts: list[str], batch_size: int = 32) -> list[list[float]]:
+    all_embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        inputs = tokenizer(batch, return_tensors="pt", truncation=True,
+                           max_length=512, padding=True)
+        with torch.no_grad():
+            outputs = model(**inputs)
+        cls_vecs = outputs.last_hidden_state[:, 0, :].tolist()
+        all_embeddings.extend(cls_vecs)
+    return all_embeddings
+```
+
+Embed all tracebacks and all failed code snippets in batches before training. Save the vectors to disk (numpy `.npy` or HDF5). Never re-embed the same text twice.
+
+**Combining tabular + embedding features:**
+```python
+import numpy as np
+
+tabular_vec = np.array(list(tabular_features.values()))         # ~20 features
+traceback_emb = np.array(traceback_embedding)                   # 768 features
+code_emb = np.array(code_embedding)                             # 768 features
+
+combined = np.concatenate([tabular_vec, traceback_emb, code_emb])  # ~1556 features
+```
+
+This combined vector is what gets fed to XGBoost in Phase 6.
+
+> **⚠️ NOTE — Dimensionality and XGBoost**
 >
-> Traceback depth is a useful feature. But the **actual error message text** is more predictive. `KeyError: 'result'` needs a completely different fix than `IndentationError: unexpected indent`.
->
-> **The fix:** Extract the last line of the traceback (the exception message).
-> Create a categorical feature for the "error message keyword":
+> XGBoost handles high-dimensional input well — 1556 features is not a problem. However, the embedding dimensions will dominate any per-feature importance plot. Before running SHAP, use PCA to compress each 768-dim embedding to 32–64 dimensions for the interpretability analysis only (keep full dimensions for training):
 > ```python
-> import re
-> last_line = traceback_str.strip().split('\n')[-1]
-> # Examples: "KeyError: 'result'", "IndentationError: unexpected indent"
-> keyword = last_line.split(':')[0].strip().lower().replace(' ', '_')
-> # -> "keyerror", "indentationerror"
+> from sklearn.decomposition import PCA
+> pca = PCA(n_components=50)
+> traceback_emb_reduced = pca.fit_transform(all_traceback_embeddings)
 > ```
-> Then one-hot encode or label-encode the top 15 most common keywords in your dataset.
-> This single feature can significantly boost your XGBoost model's accuracy because it captures **what went wrong semantically**, not just structurally.
+> Report both: full-dimension model performance, and PCA-reduced SHAP analysis for interpretability. This is standard practice and reviewers will expect it.
 
 > **⚠️ NOTE — Multicollinearity**
 >
-> `cyclomatic_complexity` and `ast_node_count` will be correlated. Compute both and include both — they measure different structural properties (branching paths vs. total node count). You will handle this in the SHAP phase by checking if both appear in the top features or if one dominates. Note this in your methodology section.
+> `cyclomatic_complexity` and `ast_node_count` will be correlated. Compute both and include both — they measure different structural properties (branching paths vs. total node count). Note this in your methodology and check if both appear in SHAP or one dominates.
 
 ---
 
 ## Phase 5: Build the Repair Ladder
-**Duration: 2 weeks | Build: Stage 4 — this creates your entire dataset**
+**Duration: 2 weeks | Build: Stage 4 — creates your entire dataset**
 
 This is the most time-consuming phase. It produces the training data for everything else.
 
@@ -268,9 +363,17 @@ for problem in failed_problems:
         if result["status"] == "pass":
             label = level
             break
-    
+
     save_record(problem_id, failure_signature, label)
 ```
+
+### What "Unrecoverable" means — be precise from the start
+
+Label a failure "Unrecoverable" only when Level 3 repair (3000 tokens) fails. In your code comments, dataset documentation, and paper, always define this as:
+
+> *"Unrecoverable via zero-shot execution feedback within the tested budget constraints using the fixed repair prompt."*
+
+Never write "the problem is unsolvable." A different prompt, a larger model, or an agentic loop might recover it. The label is scoped to your specific experimental setup. Write this definition as a docstring in the function that assigns labels.
 
 ### Critical things to get right
 
@@ -280,7 +383,7 @@ for problem in failed_problems:
 
 **3. Use offline batch inference (from Phase 2).** Run all Level 1 repairs for all problems as one batch. Then all Level 2 for the Level 1 failures. Then Level 3. Do not loop with server calls.
 
-**4. Run both models.** Qwen2.5-Coder first. Then DeepSeek-R1-Distill-Qwen. Store `"model"` in every record.
+**4. Run both models.** Qwen2.5-Coder first. Then DeepSeek-R1-Distill-Qwen. Store `"model"` in every record. For DeepSeek, store `think_tokens` and `code_tokens` separately (use the parser from Phase 2).
 
 > **⚠️ CRITICAL — Checkpointing: this experiment WILL crash**
 >
@@ -292,20 +395,18 @@ for problem in failed_problems:
 >
 > CHECKPOINT_FILE = "repair_state.jsonl"
 >
-> # On startup: load already-completed problem IDs
 > completed = set()
 > if os.path.exists(CHECKPOINT_FILE):
 >     with jsonlines.open(CHECKPOINT_FILE) as reader:
 >         for record in reader:
 >             completed.add((record["problem_id"], record["model"]))
 >
-> # In the loop: skip completed, write immediately after each
 > for problem in all_problems:
 >     if (problem.id, current_model) in completed:
->         continue  # already done, skip
->     
+>         continue
+>
 >     # ... run repair ladder ...
->     
+>
 >     with jsonlines.open(CHECKPOINT_FILE, mode='a') as writer:
 >         writer.write(record)  # write immediately, not at the end
 > ```
@@ -318,14 +419,18 @@ Each record saved to `repair_state.jsonl`:
 {
   "problem_id": "lcb_001",
   "model": "qwen2.5-coder-7b",
-  "failure_signature": {"exception_type_syntaxerror": 1, "traceback_depth": 2, ...},
+  "failure_signature": {"exception_type_syntaxerror": 1, "traceback_depth": 2, "...": "..."},
+  "traceback_embedding_path": "embeddings/lcb_001_qwen_traceback.npy",
+  "code_embedding_path": "embeddings/lcb_001_qwen_code.npy",
   "label": 1,
   "repair_tokens_used": 312,
+  "think_tokens": null,
+  "code_tokens": null,
   "git_commit": "a3f9c21"
 }
 ```
 
-Always record the git commit hash. You will thank yourself later.
+For DeepSeek records, `think_tokens` and `code_tokens` are integers. For Qwen records, they are null. Always record the git commit hash.
 
 ---
 
@@ -369,14 +474,25 @@ Always record the git commit hash. You will thank yourself later.
 
 > **⚠️ UPGRADE — Handle class imbalance**
 >
-> Your dataset will likely be imbalanced. For example, 60% of failures might be Level 1 or Unrecoverable, with only 10% being Level 3. XGBoost will learn to ignore Level 3.
->
-> **The fix:** Use `scale_pos_weight` in XGBoost for binary classification, or `class_weight='balanced'` as a wrapper. For the budget router (multiclass), compute class weights manually:
+> Your dataset will likely be imbalanced. XGBoost will learn to ignore rare classes.
 > ```python
 > from sklearn.utils.class_weight import compute_class_weight
 > weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
 > # Pass to XGBoost via sample_weight parameter in .fit()
 > ```
+
+### Run the ablation study — this is required, not optional
+
+You must train four versions of each classifier and report all four:
+
+| Model version | Features used | Purpose |
+|---|---|---|
+| Tabular only | ~20 handcrafted features | Baseline — what the old approach achieves |
+| Traceback embedding only | 768-dim CodeBERT vector of traceback | How much does reading the error text help? |
+| Code embedding only | 768-dim CodeBERT vector of failed code | How much does reading the code help? |
+| Combined (tabular + both embeddings) | ~1556 features | Full model — your main result |
+
+The gap between "tabular only" and "combined" on AssertionError cases specifically is your key finding. Filter your test set to only AssertionError failures and report AUROC for each model version on that subset. This is the single most anticipated result from reviewer feedback.
 
 ### Build Stage 5: Recoverability Classifier
 
@@ -385,9 +501,8 @@ import xgboost as xgb
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedGroupKFold
 
-# Binary: 0 = unrecoverable, 1 = recoverable
-X = feature_matrix
-y = binary_labels
+X = combined_feature_matrix   # tabular + embeddings concatenated
+y = binary_labels              # 0 = unrecoverable, 1 = recoverable
 groups = problem_id_array
 
 sgkf = StratifiedGroupKFold(n_splits=5)
@@ -405,10 +520,6 @@ print("Mean AUROC:", np.mean(auroc_scores))
 ### Build Stage 6: Budget Router
 
 For recoverable failures only (labels 1, 2, 3):
-- Labels are **ordered**: L1 < L2 < L3
-- Use `mord.OrdinalRidge` or threshold-based binary decomposition
-- Metric: Mean Absolute Level Error (not accuracy — predicting L3 when correct is L1 is a bigger error than predicting L2)
-
 ```python
 import mord
 
@@ -424,13 +535,10 @@ print("Mean Absolute Level Error:", mae)
 ## Phase 7: Learn SHAP and Run Interpretability Analysis
 **Duration: 3–4 days | Build: the scientific contribution**
 
-This is the part that turns your project from "we built a predictor" into "we discovered something."
-
 ### Read
 
-- SHAP official XGBoost notebook (exact your use case): https://shap.readthedocs.io/en/latest/example_notebooks/tabular_examples/tree_based_models/Census%20income%20classification%20with%20XGBoost.html
+- SHAP official XGBoost notebook: https://shap.readthedocs.io/en/latest/example_notebooks/tabular_examples/tree_based_models/Census%20income%20classification%20with%20XGBoost.html
 - Gentle intro to SHAP for tree models: https://machinelearningmastery.com/a-gentle-introduction-to-shap-for-tree-based-models/
-- End-to-end guide: https://www.digitalocean.com/community/tutorials/xgboost-guide-shap-analysis-code-demo
 
 ### Build
 
@@ -438,28 +546,19 @@ This is the part that turns your project from "we built a predictor" into "we di
 import shap
 
 explainer = shap.TreeExplainer(recoverability_model)
-shap_values = explainer(X_test)
+shap_values = explainer(X_test_pca)  # use PCA-reduced embeddings here for readability
 
-# Global feature importance — which features matter most overall
-shap.plots.beeswarm(shap_values)
-
-# Single prediction explanation — why did this specific failure get this label
-shap.plots.waterfall(shap_values[0])
+shap.plots.beeswarm(shap_values)          # global feature importance
+shap.plots.waterfall(shap_values[0])      # single prediction explanation
 ```
 
 > **⚠️ UPGRADE — Use SHAP Dependence Plots for your paper figures**
 >
-> The beeswarm plot shows global importance. But reviewers want to see **directional relationships**.
->
-> Use `shap.plots.scatter` to create dependence plots:
 > ```python
-> # Does AST complexity predict Level 3 repairs?
 > shap.plots.scatter(shap_values[:, "cyclomatic_complexity"])
->
-> # Does TimeoutError predict unrecoverability?
 > shap.plots.scatter(shap_values[:, "exception_type_timeouterror"])
 > ```
-> Each plot shows one feature on the X-axis and its SHAP contribution on the Y-axis. A clear upward trend proves your hypothesis visually. These plots become your best paper figures.
+> Each plot shows one feature on the X-axis and its SHAP contribution on the Y-axis. A clear upward trend proves your hypothesis visually. These become your best paper figures.
 
 ### What to answer with SHAP (write these as numbered observations in your paper)
 
@@ -469,17 +568,25 @@ shap.plots.waterfall(shap_values[0])
 4. Does high `cyclomatic_complexity` correlate with Level 3?
 5. Does `runtime_ms` close to the timeout limit predict unrecoverability?
 6. Are the top 3 features the same for both Qwen failures and DeepSeek failures?
+7. **For AssertionError failures specifically:** which embedding dimensions drive predictions? (This is the key finding that justifies embeddings over tabular features.)
 
-**Multicollinearity check:** Before SHAP, plot a correlation matrix of all features. If `cyclomatic_complexity` and `ast_node_count` have r > 0.85, note it in the methodology and justify keeping both (they measure different structural properties: branching paths vs. total node count).
+### AssertionError misprediction analysis — write this as a paper section
 
-**Error analysis on mispredictions:** Find every case where you predicted RECOVERABLE but it was actually UNRECOVERABLE. Print those failure signatures. Look for patterns manually. Write 3–5 observations. This is one paragraph in the paper that professors will find most interesting — it turns a classification result into a finding about LLM failure modes.
+Filter your test set to only AssertionError failures. For this subset:
+- Compare tabular-only AUROC vs. combined AUROC
+- Print the failure signatures of every case where tabular-only predicted RECOVERABLE but it was UNRECOVERABLE (the hard cases the tabular model misses)
+- Check if embeddings correctly classify those same cases
+
+Write 3–5 observations. This turns a classification result into a finding about what information actually determines repair cost when the exception type is ambiguous.
+
+**Multicollinearity check:** Before SHAP, plot a correlation matrix. If `cyclomatic_complexity` and `ast_node_count` have r > 0.85, note it and justify keeping both.
 
 ---
 
-## Phase 8: Baselines, Evaluation, and Generalization
-**Duration: 1 week | Build: final comparison**
+## Phase 8: Baselines, Best-of-N, DeepSeek Analysis, and Final Evaluation
+**Duration: 1–2 weeks | Build: all comparisons and the secondary findings**
 
-### Run all five baselines
+### Run all six baselines
 
 ```python
 TOKEN_CAPS = {0: 0, 1: 500, 2: 1500, 3: 3000}
@@ -498,14 +605,95 @@ def evaluate_policy(policy_name, policy_fn, test_set):
     cna = pass_rate / total_tokens
     return {"pass@1": pass_rate, "total_tokens": total_tokens, "CNA": cna}
 
-# Run all five
-evaluate_policy("no_repair",   lambda x: 0,                   test_set)
-evaluate_policy("always_l1",   lambda x: 1,                   test_set)
-evaluate_policy("always_l3",   lambda x: 3,                   test_set)
+evaluate_policy("no_repair",   lambda x: 0,                      test_set)
+evaluate_policy("always_l1",   lambda x: 1,                      test_set)
+evaluate_policy("always_l3",   lambda x: 3,                      test_set)
 evaluate_policy("random",      lambda x: random.choice([1,2,3]), test_set)
-evaluate_policy("oracle",      lambda x: x["true_label"],     test_set)
+evaluate_policy("oracle",      lambda x: x["true_label"],        test_set)
 evaluate_policy("adaptive",    lambda x: router.predict([x])[0], test_set)
+evaluate_policy("best_of_n",   best_of_n_policy,                 test_set)
 ```
+
+### Best-of-N baseline — how to implement it
+
+This is the most important new baseline. For a given token budget, instead of routing a single repair, generate N independent repair attempts (with temperature > 0) and pick the first one that passes tests.
+
+```python
+def best_of_n_policy(failure, n=3, tokens_per_attempt=500):
+    """
+    Budget equivalent to Level 2 (1500 tokens): 3 attempts × 500 tokens each.
+    Uses temperature=0.7 so each attempt is different.
+    """
+    for _ in range(n):
+        repair = call_model(
+            prompt=REPAIR_PROMPT.format(**failure),
+            max_new_tokens=tokens_per_attempt,
+            temperature=0.7      # must be > 0 or all attempts are identical
+        )
+        result = safe_execute(repair)
+        if result["status"] == "pass":
+            return "pass", _ + 1  # passed on attempt number _+1
+    return "fail", n
+
+# Report: for the same total token budget (1500), does Best-of-3 at 500 tokens each
+# beat your adaptive router's Level 2 assignment?
+```
+
+The comparison you are making: for problems your router sends to Level 2 (1500 tokens), does spending those 1500 tokens as one single repair vs. three 500-token parallel attempts change the pass rate? If Best-of-N wins, your core claim needs reframing. If your router wins, you have proved that execution-guided routing is better than brute-force sampling.
+
+### Sandbox latency measurement — report this honestly
+
+Your pipeline has overhead beyond token generation:
+1. Sandbox spin-up + code execution time
+2. Traceback extraction
+3. Embedding forward pass (CodeBERT)
+4. XGBoost inference
+
+Measure and report each component separately:
+
+```python
+import time
+
+timings = {}
+
+t0 = time.perf_counter()
+execution_result = safe_execute(generated_code)
+timings["sandbox_ms"] = (time.perf_counter() - t0) * 1000
+
+t0 = time.perf_counter()
+embedding = embed_text(execution_result["traceback"])
+timings["embedding_ms"] = (time.perf_counter() - t0) * 1000
+
+t0 = time.perf_counter()
+predicted_level = router.predict([combined_features])
+timings["routing_ms"] = (time.perf_counter() - t0) * 1000
+```
+
+In your paper, report the mean values. The expected finding: XGBoost routing is microseconds, CodeBERT embedding is ~5–20ms per sample on GPU, sandbox execution is the dominant cost (100–500ms per run) and is unavoidable in any execution-guided system. Acknowledge in the limitations section that total wall-clock time per problem is higher than token cost alone suggests, and that this overhead must be weighed against token savings in latency-sensitive deployments.
+
+### DeepSeek-R1 thinking token analysis
+
+By this phase you have stored `think_tokens` and `code_tokens` for every DeepSeek generation. Now analyze them:
+
+```python
+import pandas as pd
+
+df_deepseek = df[df["model"] == "deepseek-r1-distill-qwen-7b"].copy()
+
+# Group by exception type, compute mean thinking tokens
+print(df_deepseek.groupby("exception_type")[["think_tokens", "code_tokens"]].mean())
+
+# Expected: SyntaxError → low think_tokens, TimeoutError → high think_tokens
+```
+
+Train a secondary XGBoost model to predict `think_tokens` (continuous, treat as regression) from the failure signature features. Run SHAP on this secondary model to identify which failure types drive thinking budget.
+
+**Key questions to answer:**
+1. Which exception types require the most thinking tokens on average?
+2. Does `think_tokens` correlate with repair label (L1/L2/L3/Unrecoverable)?
+3. When DeepSeek is given a 500-token cap for a Level 1 repair, what fraction of that is spent in `<think>` vs. actual code? Is the code output being truncated?
+
+Write these up as a standalone subsection. A reviewer who called this a potential standalone contribution was not exaggerating — it is a novel empirical finding about how reasoning models allocate internal computation across failure types.
 
 ### Calibration (Brier Score)
 
@@ -524,7 +712,7 @@ print("Brier Score:", brier)
 
 > **⚠️ UPGRADE — Use Weights & Biases for experiment tracking**
 >
-> Do not track your baseline results in text files or spreadsheets. Use **Weights & Biases** (free for academics): https://wandb.ai
+> Do not track results in text files. Use **Weights & Biases** (free for academics): https://wandb.ai
 >
 > ```python
 > import wandb
@@ -532,12 +720,7 @@ print("Brier Score:", brier)
 > wandb.log({"pass@1": 0.73, "total_tokens": 142000, "CNA": 5.14e-6, "AUROC": 0.81})
 > ```
 >
-> Benefits:
-> - Every run automatically logs your git commit hash — perfect reproducibility
-> - Pull publication-ready charts directly for your paper
-> - Share a live dashboard link in your README and in emails to professors
-> - Compare all six baselines visually in one view
->
+> Every run logs your git commit hash automatically. Share the dashboard link in your README and in emails to professors.
 > Free academic signup: https://wandb.ai/site/research
 
 ---
@@ -550,10 +733,11 @@ One per week, while building phases 3–8.
 |---|---|---|
 | Phase 3 | "Evaluating Large Language Models Trained on Code" (Codex) — https://arxiv.org/abs/2107.03374 | Understand pass@k and code eval methodology |
 | Phase 4 | "Is Self-Repair a Silver Bullet for Code Generation?" — https://arxiv.org/abs/2306.09896 | Direct related work to your project |
+| Phase 4 | CodeBERT paper — https://arxiv.org/abs/2002.08155 | Understand what model you are using for embeddings and why |
 | Phase 5 | "Can LLMs Debug Their Own Code?" — search arxiv 2024 | What has already been tried |
 | Phase 6 | Snell et al. 2024 — full read now | You skimmed this in Phase 1. Now read it completely. |
 | Phase 7 | "A Unified Approach to Interpreting Model Predictions" (SHAP paper) — https://arxiv.org/abs/1705.07874 | Understand what SHAP actually computes |
-| Phase 8 | Any recent inference efficiency paper on FLOPs vs tokens | Situate your CNA metric in the literature |
+| Phase 8 | "Large Language Monkeys: Scaling Inference Compute with Repeated Sampling" — https://arxiv.org/abs/2407.21787 | The Best-of-N literature your baseline comes from |
 
 ---
 
@@ -562,15 +746,17 @@ One per week, while building phases 3–8.
 | Tool | What it does in your project | Install |
 |---|---|---|
 | `vllm` | Offline batch inference for Qwen + DeepSeek | `pip install vllm` |
-| `transformers` | Load models from Hugging Face | `pip install transformers` |
+| `transformers` | CodeBERT embeddings + load models from Hugging Face | `pip install transformers` |
+| `torch` | Required for CodeBERT forward pass | `pip install torch` |
 | `e2b-code-interpreter` | Secure sandboxed code execution (Option A) | `pip install e2b-code-interpreter` |
 | Docker | Isolated execution with hard resource limits (Option B) | Install Docker Desktop |
 | `radon` | Cyclomatic complexity, LOC metrics | `pip install radon` |
 | `xgboost` | Both classifiers | `pip install xgboost` |
 | `shap` | Feature importance + dependence plots | `pip install shap` |
 | `mord` | Ordinal regression for budget router | `pip install mord` |
-| `scikit-learn` | GroupKFold, class weights, metrics | `pip install scikit-learn` |
+| `scikit-learn` | GroupKFold, PCA, class weights, metrics | `pip install scikit-learn` |
 | `pandas` | Managing the dataset | `pip install pandas` |
+| `numpy` | Feature matrix operations | `pip install numpy` |
 | `jsonlines` | Checkpointed experiment data | `pip install jsonlines` |
 | `wandb` | Experiment tracking and dashboards | `pip install wandb` |
 | LiveCodeBench | Benchmark + evaluation harness | `git clone` + `poetry install` |
@@ -583,26 +769,32 @@ One per week, while building phases 3–8.
 |---|---|---|
 | 0 — Foundations check | 1 week | Python, ML, Git solid |
 | 1 — Read the papers | 1 week | Understand the problem space |
-| 2 — LLM basics + local inference | 1 week | Model running locally, batch inference working |
+| 2 — LLM basics + local inference + DeepSeek parser | 1 week | Model running locally, batch inference working, think/code parser built |
 | 3 — LiveCodeBench + Stage 1+2 | 1–2 weeks | Raw failure dataset with safe execution |
-| 4 — Failure signature extractor | 1 week | Stage 3 complete with NLP traceback features |
+| 4 — Failure signature extractor (tabular + embeddings) | 1–2 weeks | Stage 3 complete with CodeBERT embeddings |
 | 5 — Repair ladder | 2 weeks | Full training dataset with checkpointing |
-| 6 — XGBoost classifiers | 1 week | Stage 5+6 with leak-free GroupKFold |
-| 7 — SHAP analysis | 4 days | Dependence plots + written observations |
-| 8 — Baselines + generalization | 1 week | All results in W&B dashboard |
-| **Total** | **~11 weeks** | **Complete, reproducible project** |
+| 6 — XGBoost classifiers + ablation | 1 week | Stage 5+6, all four model versions, leak-free GroupKFold |
+| 7 — SHAP + AssertionError analysis | 4 days | Dependence plots + written observations |
+| 8 — Baselines + Best-of-N + DeepSeek analysis + latency | 1–2 weeks | All results in W&B dashboard |
+| **Total** | **~12 weeks** | **Complete, reproducible project** |
 
 ---
 
 ## Final Checklist: What Your Repository Must Have
 
-Before emailing any professor or submitting anywhere, verify all five:
+Before emailing any professor or submitting anywhere, verify all of these:
 
-- [ ] **`pyproject.toml` or `requirements.txt`** with exact pinned versions of `vllm`, `xgboost`, `shap`, `radon`, `mord`
+- [ ] **`pyproject.toml` or `requirements.txt`** with exact pinned versions of all libraries
 - [ ] **E2B or Docker sandbox** for all code execution — no raw `subprocess` on untrusted code
-- [ ] **`StratifiedGroupKFold` by `problem_id`** — document in your methodology that no data leakage occurred
-- [ ] **NLP traceback feature** — error message keyword extracted and encoded, not just traceback depth
-- [ ] **W&B dashboard link** in your README showing CNA curves for all six baselines
+- [ ] **`StratifiedGroupKFold` by `problem_id`** — documented in methodology, no data leakage
+- [ ] **CodeBERT embeddings** of traceback + failed code stored as `.npy` files, loadable without re-running
+- [ ] **Ablation table** comparing tabular-only, embedding-only, and combined models
+- [ ] **AssertionError subset analysis** — AUROC breakdown for this class specifically
+- [ ] **Best-of-N baseline results** — at matched token budgets
+- [ ] **Sandbox latency measurements** — per-component timing reported honestly
+- [ ] **DeepSeek thinking token breakdown** — per exception type, with secondary SHAP analysis
+- [ ] **W&B dashboard link** in README showing CNA curves for all seven baselines
+- [ ] **"Unrecoverable" definition** written as a docstring in label assignment code and in the paper
 
 ---
 
@@ -612,11 +804,12 @@ Before emailing any professor or submitting anywhere, verify all five:
 Every phase has a concrete artifact to produce. Do not spend three weeks watching lectures. Watch one video, build the thing, then move on.
 
 **Your dataset is the project.**
-The repair ladder data — failure signatures mapped to minimum repair levels — is the novel contribution. Even if your classifiers perform poorly, you have built a dataset that other researchers can use. Protect it. Back it up in two places. Document every field.
+The repair ladder data — failure signatures + CodeBERT embeddings mapped to minimum repair levels — is the novel contribution. Even if your classifiers perform poorly, you have built a dataset that other researchers can use. Protect it. Back it up in two places. Document every field.
 
-**The five traps that kill research projects:**
+**The six traps that kill research projects:**
 1. Using server-mode inference in a loop for 3,000 generations → use offline batch
 2. Running untrusted code without sandboxing → use E2B or Docker
 3. Random train/test split across same problem IDs → use GroupKFold
 4. Script crashes at generation 2,847 with no checkpoint → write checkpoint from day one
 5. Tracking results in text files → use W&B from the first experiment
+6. Forgetting to store `think_tokens` / `code_tokens` on DeepSeek runs → parse and save them in Phase 2, before Phase 5 begins
