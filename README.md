@@ -1,11 +1,11 @@
 # Learning Compute Allocation Policies from Execution Feedback
-### A Complete Technical Explanation of the Project
+### A Practical Technical Plan
 
 ---
 
 ## What I Am Building — The One-Liner
 
-I am building a system that watches how a language model *fails* on a coding problem, extracts structured information from that failure, and uses it to predict exactly how much extra computation is needed to fix the failure — before spending that computation. The system then routes each failure to the cheapest repair strategy that is likely to work.
+A system that watches how a language model *fails* on a coding problem, extracts structured information from that failure, and predicts how much extra computation is needed to fix it — before spending that computation. Each failure is then routed to the cheapest repair budget likely to work.
 
 ---
 
@@ -13,208 +13,182 @@ I am building a system that watches how a language model *fails* on a coding pro
 
 ### Background: What is Test-Time Compute?
 
-Modern large language models (LLMs) can improve their own answers by spending more computation *at inference time* — the moment they are actually generating a response. This is called **Test-Time Compute (TTC)**.
-
-Instead of generating one answer and stopping, the model can:
-- Try again with a different approach
-- Generate multiple candidate solutions and pick the best one
-- Iteratively debug a failed solution using its own error output
-- Reason step-by-step at length before committing to an answer
-
-All of these strategies improve accuracy — but they all cost more tokens, more time, and more money.
+Modern LLMs can improve answers by spending more computation at inference time (Test-Time Compute, TTC): retrying, sampling multiple candidates, or iteratively debugging using their own error output. All of these cost more tokens, time, and money.
 
 ### The Inefficiency Being Solved
 
-Current systems that use test-time compute for code generation are dumb about *how much* compute they allocate. When a model fails on a problem, the system retries with a fixed budget — say, 2000 extra tokens — regardless of whether the failure was a trivial one-line syntax error or a completely wrong algorithmic approach.
+Current systems retry with a **fixed** token budget regardless of failure severity.
 
-**Concrete Example A:**
-A generated Python function has a missing colon on line 3. The rest of the code is correct. Fixing this requires approximately 100–200 tokens. The system allocates 2000. Result: ~1800 tokens wasted.
+**Real Example A — trivial syntax error:**
+```
+SyntaxError: expected ':'
+  File "<solution>", line 7
+    if n > 0
+            ^
+```
+This is a one-line fix. A 500-token repair budget is overkill by 4-8x.
 
-**Concrete Example B:**
-A generated function solves a sorting problem using O(N²) bubble sort, but the test cases involve arrays of 100,000 elements and require O(N log N) performance. The entire algorithm is wrong — no surface-level patching fixes it. The system allocates 2000 tokens. Result: all 2000 tokens wasted on a failure that is fundamentally unrecoverable without a full rewrite.
+**Real Example B — wrong algorithm under a time limit:**
+```
+TimeoutError: Execution exceeded 2000ms time limit
+  Test case: n = 100000
+```
+An O(N²) solution against N=100,000 will never pass regardless of repair budget — no surface patch fixes an asymptotic complexity problem. A fixed 2000-token budget is fully wasted here.
 
-If the system knew *in advance* that Example A only needs 200 tokens and Example B is unrecoverable, it could:
-- Save the 1800 wasted tokens in Example A
-- Save the 2000 wasted tokens in Example B
-- Spend those saved tokens on other problems that genuinely need them
-
-**The core insight is:** the failure itself — the exception type, the traceback, the runtime, the structure of the code — contains enough signal to predict how expensive the fix will be. The project tests whether this is true and builds a system around it.
+These two failures look completely different at the moment they happen, and that difference is detectable *before* any repair tokens are spent. That's the core bet of this project.
 
 ---
 
-## The Central Scientific Hypothesis
+## The Central Hypothesis (Chain Form)
 
-The hypothesis has three parts, forming a chain:
-
-**Part 1:** Different failure modes require fundamentally different amounts of compute to repair.
-- A SyntaxError is structurally different from a TimeoutError.
-- A shallow traceback (1 level deep) is structurally different from a deep one (8 levels deep).
-- These differences should correspond to differences in repair cost.
-
-**Part 2:** The failure signature — the structured information available immediately after execution — contains enough signal to predict repair cost.
-- You don't need to attempt the repair to know how expensive it will be.
-- The error output already encodes this information, if you know how to read it.
-
-**Part 3:** A lightweight predictor trained on historical failure-to-repair-cost data can route each new failure to the right compute budget adaptively, with better efficiency than any fixed-budget strategy.
-
-The chain being tested:
+1. **Different failure modes require different repair effort.** A `SyntaxError` is structurally different from a `TimeoutError`; a 1-frame traceback is different from an 8-frame one. These differences correlate with repair cost.
+2. **The failure signature — exception type, traceback, runtime, code structure — contains enough signal to predict repair cost** without attempting the repair.
+3. **A lightweight classifier trained on historical failure→repair-cost data can route new failures to the right budget**, beating any fixed-budget strategy on cost-per-correct-answer.
 
 ```
 Execution Failure
       ↓
-Failure Signature Extraction  (what exception? how deep? how long did it run? how complex is the code?)
+Failure Signature Extraction
       ↓
-Recoverability Prediction     (is this failure fixable at all?)
+Recoverability Prediction  (is this fixable at all, under this budget regime?)
       ↓
-Budget Routing                (if fixable, how many tokens does it need?)
+Budget Routing  (if fixable, how many tokens?)
       ↓
-Targeted Repair Attempt       (spend only what is needed)
+Targeted Repair Attempt
 ```
 
 ---
 
 ## What This Project Is NOT
 
-This is easy to confuse with adjacent work, so being explicit:
-
 | This project is NOT about... | This project IS about... |
 |---|---|
 | Improving code generation quality | Deciding how much compute to spend *per failure* |
 | Building a better coding agent | Resource allocation during inference |
-| Training or fine-tuning a new language model | Using existing models as fixed black boxes |
-| Prompt engineering or better repair prompts | Studying failure signatures as a predictive signal |
+| Training or fine-tuning a new LLM | Using existing models as fixed black boxes |
+| Prompt engineering for better repairs | Studying failure signatures as a predictive signal |
 | Self-debugging systems | Compute economics for inference |
 
-The language models are treated as completely fixed black boxes. They are not modified, fine-tuned, or trained in any way. They are run, and their failures are studied.
+LLMs are treated as fixed black boxes — never modified or fine-tuned, only run and observed.
+
+---
+
+## Practical Feasibility — Read This Before Building Anything
+
+This section is the part most plans like this skip, and it's the part that determines whether the rest of the design even works.
+
+### How much data will I actually have?
+
+LiveCodeBench (any single pinned release) has on the order of a few hundred problems. Running two 7B models against it, with realistic failure rates of roughly 40-60% on Medium/Hard problems, gives you **roughly 150-500 labeled failures per model** — not thousands. This is the single most important number in the whole project, because it constrains every modeling choice downstream.
+
+Consequences:
+- **Raw 768-dim embeddings concatenated with ~20 tabular features, fed to anything (XGBoost or an MLP), will overfit at this sample size.** The embedding dimensionality is larger than the number of rows. This is not a tree-vs-neural-network problem — it's a curse-of-dimensionality problem that affects both equally.
+- **Fix: reduce embedding dimensionality before fusion.** PCA or UMAP down to 16-32 components per embedding is the standard, practical approach for small-N + high-D fusion problems, and it's an afternoon of work, not a new model architecture.
+- With dimensionality-reduced embeddings, **XGBoost remains the practical default**: it handles small tabular datasets well, gives you `TreeExplainer` SHAP for free, and doesn't need the extra infrastructure of a neural training loop + `DeepExplainer`.
+
+### Is the XGBoost-vs-MLP question worth keeping at all?
+
+Yes — but as a **secondary ablation**, not the headline architecture decision. Comparing "XGBoost on tabular + PCA-reduced embeddings" against "small MLP on tabular + raw embeddings" is a legitimate, citable experiment about whether axis-aligned splits lose information that a continuous fusion layer captures. But running that comparison should not block the main pipeline — build the XGBoost+PCA version first since it's faster to get working end-to-end, then add the MLP comparison if time permits.
+
+### How many LLM calls does this actually require?
+
+For each model (2 total):
+- 1 generation per problem (baseline) — a few hundred calls
+- For each failure, **up to 3 sequential repair attempts** (Level 1 → Level 2 → Level 3, stopping early on success) — realistically averages ~1.5-2 repair calls per failure, not always 3
+
+Rough order of magnitude: **~400 problems × 2 models × (1 baseline + ~1 avg repair) ≈ 1,500-2,000 total generation calls.** This is feasible on a single modern GPU (24GB+ VRAM, e.g. a 4090 or A100) for local 7B models over a few days, or via API at a cost that should be estimated up front using current provider pricing before committing — token-heavy reasoning traces from DeepSeek-R1 will dominate the cost if using a paid API.
+
+### Sandbox execution cost
+
+Running hundreds to low-thousands of code submissions in an isolated sandbox (subprocess + timeout, or Docker) is cheap computationally but adds real wall-clock time due to process spin-up. Budget for this explicitly — it's usually the slowest part of the pipeline in practice, not the model inference.
 
 ---
 
 ## Dataset: LiveCodeBench
 
-### Why Not HumanEval (the most common benchmark)?
+### Why Not HumanEval?
 
-HumanEval is the most well-known code generation benchmark. It is NOT used in this project because:
-- Modern 7B–8B models solve 80%+ of HumanEval problems — this project studies *failures*, so if only 10–20% of problems fail, the failure dataset is too small to train any meaningful predictor
-- HumanEval is heavily contaminated — many models have seen it during training, making failure rates artificially low and unrepresentative
+Modern 7B models solve 80%+ of HumanEval, leaving too few failures to build a training set, and contamination makes failure rates unrepresentative.
 
 ### Why LiveCodeBench?
 
-LiveCodeBench is a continuously updated competitive programming benchmark:
-- Problems are sourced from recent competitive programming contests held *after* model training cutoffs — so models cannot have memorized solutions
-- Tasks are hard algorithmic reasoning problems where modern 7B models still fail significantly (failure rates high enough to build a training dataset)
-- Evaluation is fully objective — a solution either passes all hidden test cases or it does not; no LLM judge, no rubric
-- No contamination risk since problems are added post-training
-- The benchmark version is pinned via commit hash, ensuring full reproducibility
+- Problems are sourced from contests held after model training cutoffs — low memorization risk
+- High enough failure rates on Medium/Hard problems to build a usable (if modest-sized) failure dataset
+- Fully objective pass/fail via hidden test cases — no LLM judge needed
+- Benchmark version pinned via commit hash for reproducibility
+
+**Before finalizing the plan, run a quick pilot**: generate on ~50 problems with both models, measure the actual failure rate and exception-type distribution. This 30-minute pilot tells you whether your real dataset will be 150 failures or 500, and whether `AssertionError` really dominates (it usually does) — this directly determines whether dimensionality reduction is "nice to have" or "mandatory."
 
 ---
 
 ## Models Used
 
-Two models are deliberately chosen to test generalization across architectures:
-
 ### Model 1 — Qwen2.5-Coder-7B
-- A standard code generation model
-- No built-in chain-of-thought or reasoning traces
-- Generates code directly without thinking tokens
-- Represents baseline coding LLM behavior
+Standard code generation model, no chain-of-thought, generates code directly.
 
 ### Model 2 — DeepSeek-R1-Distill-Qwen-7B
-- A native reasoning model distilled from DeepSeek-R1
-- Produces explicit `<think>...</think>` internal reasoning traces before writing code
-- Architecturally different from Qwen — uses significantly more tokens per problem due to the thinking phase
-- Tests whether failure signatures and repair cost patterns from one architecture transfer to another
+Native reasoning model producing explicit `<think>...</think>` traces before code. Architecturally distinct from Qwen — tests whether the failure→repair-cost relationship transfers across architectures.
 
-**Why two models matter:** If the failure-to-repair-cost relationship learned from Qwen's failures also predicts DeepSeek's repair costs, the approach generalizes across architectures and could be deployed broadly. If not, the system needs to be retrained per model — which is still useful but less impactful.
-
-**Important technical note on DeepSeek-R1 (the thinking token problem):**  
-DeepSeek-R1 generates its output in two phases — a `<think>` block (internal reasoning, which can be hundreds to thousands of tokens) followed by the actual code. When enforcing token budget caps on repair attempts, a hard cap of 500 total tokens on DeepSeek-R1 might allow only ~300 tokens for thinking and ~200 tokens for code output — which is insufficient to write a complete function. The analysis will parse `<think>` tokens separately from coding tokens to study this problem explicitly. This is a known limitation that is treated as a finding rather than ignored.
+**Thinking-token caveat (real, observed behavior):** DeepSeek-R1-style models can spend their *entire* token budget inside `<think>` and emit no code at all if the cap is too low. A 500-token cap might be ~400 tokens of reasoning and ~100 tokens of code — often not enough for a complete function. This is tracked by parsing `<think>` tokens separately and is reported as a finding, not hidden.
 
 ---
 
-## The Full System Pipeline — All Six Stages
+## The Full System Pipeline
 
 ### Stage 1: Baseline Code Generation
-
-- **Input:** Every problem in the LiveCodeBench dataset (problem description + function signature + hidden test cases)
-- **Models:** Qwen2.5-Coder-7B and DeepSeek-R1-Distill-Qwen-7B, run separately and independently
-- **Decoding Settings:** Temperature = 0, greedy decoding (fully deterministic — the model always picks the highest probability next token, no randomness)
-- **Output:** One generated Python function per problem per model
-- **Data Recorded:**
-  - The full generated code
-  - Total token count of the generation
-  - Inference latency in milliseconds
-  - Lines of code
-  - Whether DeepSeek's output contains `<think>` traces and how long they are
-
-Greedy decoding is used so results are perfectly reproducible. Running the same model on the same problem twice always produces the same code.
-
----
+- Input: every LiveCodeBench problem (description + signature + hidden tests)
+- Models: Qwen2.5-Coder-7B and DeepSeek-R1-Distill-Qwen-7B, run independently
+- Decoding: temperature = 0, greedy (fully reproducible)
+- Recorded: generated code, total token count, latency (ms), lines of code, `<think>` trace presence/length
 
 ### Stage 2: Execution and Evaluation
+Every generated function runs against LiveCodeBench's hidden tests in an isolated sandbox.
 
-Every generated function is executed against LiveCodeBench's official test suite in an isolated sandbox.
+- **PASS** → done, no further processing
+- **FAIL** → full failure info captured for Stage 3:
+  - Exception type (`SyntaxError`, `AssertionError`, `IndexError`, `ValueError`, `TypeError`, `TimeoutError`, `RecursionError`, `NameError`, `AttributeError`, etc.)
+  - Full traceback text
+  - Traceback depth (stack frame count)
+  - Runtime in ms
+  - Failure line number
+  - The specific test case that triggered failure
 
-**Outcome A — PASS:** The problem is solved. It is marked as solved and no further processing happens for this problem.
-
-**Outcome B — FAIL:** The execution failed. Full failure information is captured and passed to Stage 3.
-
-For every failure, the following is recorded verbatim:
-- **Exception type:** The exact Python exception class raised (`SyntaxError`, `AssertionError`, `IndexError`, `ValueError`, `TypeError`, `TimeoutError`, `RecursionError`, `MemoryError`, `NameError`, `AttributeError`, etc.)
-- **Full traceback text:** The complete stack trace as printed by Python
-- **Traceback depth:** How many stack frames deep the error occurred
-- **Runtime in milliseconds:** How long execution ran before failing
-- **Failure line number:** Which line of the generated code triggered the error
-- **Test case that triggered the failure:** Which test input caused the failure first
-
-No LLM judge is used anywhere in this pipeline. Correctness is entirely objective.
-
----
+No LLM judge anywhere — correctness is purely pass/fail against hidden tests.
 
 ### Stage 3: Failure Signature Extraction
 
-Every failed solution is converted into a structured numerical feature vector. This is the input to every downstream predictor. Only information available at the *exact moment of failure* is used — no future information is allowed, and no repair is attempted yet.
+Every failure becomes a structured feature vector. Only information available *at the moment of failure* is used — no future information, no repair attempted yet.
 
-The feature vector contains the following groups of features:
+**Execution features:**
+- Exception type (one-hot across observed categories)
+- Traceback depth
+- Runtime (ms)
+- Failure line number (normalized by total lines)
+- Timeout binary flag
 
-**Execution Features (from running the code):**
-- Exception type: one-hot encoded across all exception categories observed in the dataset
-- Traceback depth: integer count of stack frames
-- Runtime in milliseconds: continuous float
-- Failure line number: integer (normalized by total lines of code)
-- Whether the failure was a timeout (binary flag, since timeout signals algorithmic failure specifically)
+**Code structure features (static analysis):**
+- Total token count, lines of code
+- AST node count (complexity proxy)
+- Cyclomatic complexity
+- Number of function definitions
+- Max nesting depth
+- Recursion binary flag
 
-**Code Structure Features (from analyzing the generated code statically):**
-- Total token count of the generated solution
-- Lines of code (raw count)
-- AST complexity score: number of nodes in the abstract syntax tree of the code
-- Cyclomatic complexity: number of independent code paths (branches, loops, conditions)
-- Number of function definitions in the code
-- Nesting depth: maximum depth of nested control flow (loops inside loops, etc.)
-- Whether the code contains recursion (binary flag)
-
-**Problem Features (from the original problem statement):**
+**Problem features:**
 - Prompt length in tokens
-- Problem difficulty level as labeled by LiveCodeBench (Easy / Medium / Hard, encoded ordinally)
+- Difficulty (Easy/Medium/Hard, ordinal)
 
-**Embedding Features (semantic representation — the upgrade over pure tabular features):**
-- A dense vector embedding of the full traceback text, generated by a frozen code embedding model (StarEncoder or CodeBERT)
-- A dense vector embedding of the failed code, generated by the same frozen model
-- These embeddings capture semantic meaning that the tabular features cannot — e.g., the difference between a `TimeoutError` caused by a missing break statement vs. one caused by using bubble sort on a large array
+**Embedding features (dimensionality-reduced):**
+- Embed the full traceback text and the failed code using a frozen embedding model (CodeBERT or StarEncoder)
+- **Apply PCA (or UMAP) to reduce each embedding from 768 dims to ~16-32 dims** before concatenation — this is the step that makes fusion with a few hundred training rows viable
+- Concatenate reduced embeddings with tabular features into the final feature vector
 
-The tabular features and embedding features are concatenated into a single feature vector. This combined representation is what gets fed to the classifiers.
+This combined, dimensionality-reduced vector is what feeds the classifiers in Stages 5 and 6.
 
----
+### Stage 4: Ground-Truth Label Discovery
 
-### Stage 4: Ground-Truth Label Discovery (Building the Training Dataset)
+Every failure runs through a **repair ladder** with increasing token budgets, using a **frozen, identical repair prompt** at every level to isolate the effect of compute from the effect of prompting:
 
-This is the most critical stage — it builds the dataset that everything else trains on.
-
-Every failed solution is run through a **repair ladder** with increasing token budgets. The goal is to discover the *minimum budget that successfully repairs each failure*.
-
-**The methodological decision that controls the main confound:**  
-The repair prompt template is completely frozen and identical for every experiment. The only variable being changed across budget levels is the maximum token budget allowed for the repair output. This isolates the effect of compute (tokens) from the effect of prompting (instructions).
-
-**Fixed Repair Prompt Template (identical for every experiment, every model, every budget level):**
 ```
 Original Problem: [problem description]
 Failed Code: [the full generated solution that failed]
@@ -222,207 +196,173 @@ Execution Traceback: [the complete error output]
 Instruction: Fix the code and output only the corrected Python function.
 ```
 
-**The Repair Budget Ladder:**
+**Repair Budget Ladder:**
 
-| Level | Token Cap | Interpretation |
+| Level | Token Cap | Typical Failure Type |
 |---|---|---|
-| Level 0 | 0 tokens | No repair attempted — baseline |
-| Level 1 | 500 tokens | Surface-level fixes: syntax errors, off-by-one, missing return statement, wrong variable name |
-| Level 2 | 1500 tokens | Logic errors requiring more reasoning space: wrong conditional, missing edge case, incorrect data structure |
-| Level 3 | 3000 tokens | Complex algorithmic failures requiring full restructuring: wrong algorithm, fundamental approach change |
+| Level 0 | 0 | No repair — baseline |
+| Level 1 | 500 | Syntax errors, off-by-one, missing return, wrong variable name |
+| Level 2 | 1500 | Wrong conditional, missing edge case, wrong data structure |
+| Level 3 | 3000 | Wrong algorithm, full restructuring needed |
 
-**How ground-truth labels are assigned (sequential testing):**
-1. Try Level 1 repair (500-token cap). If the repaired code passes all tests → label this failure as **Level 1**.
-2. If Level 1 repair fails → try Level 2 repair (1500-token cap). If it passes → label as **Level 2**.
-3. If Level 2 repair fails → try Level 3 repair (3000-token cap). If it passes → label as **Level 3**.
-4. If Level 3 repair also fails → label as **Unrecoverable**.
+**Sequential labeling:** try Level 1 → if pass, label = L1. Else try Level 2 → if pass, label = L2. Else try Level 3 → if pass, label = L3. Else label = **Unrecoverable**.
 
-**Critical definitional note — what "Unrecoverable" actually means:**
-"Unrecoverable" does NOT mean the problem is mathematically unsolvable. It means: *unrecoverable via zero-shot execution feedback within the tested budget constraints using the fixed repair prompt.* A different prompt, a larger model, or an agentic loop might recover it. This scoping is stated explicitly everywhere the term appears. "Unrecoverable" is always shorthand for "unrecoverable under these specific experimental conditions," never an absolute claim about the problem itself.
+**On "Unrecoverable":** this means *unrecoverable via zero-shot execution feedback within these specific budget caps and this specific prompt* — not mathematically unsolvable. A different prompt, larger model, or agentic loop might recover it. This scoping is stated everywhere the term is used.
 
-This sequential testing ensures the label is always the *minimum* sufficient budget, not just any budget that works.
+**Output:** `[failure signature] → [L1 / L2 / L3 / Unrecoverable]` — the dataset Stages 5 and 6 train on. Given the realistic dataset size (~150-500 rows per model), expect class imbalance toward L1 and Unrecoverable, with L2/L3 sparsely populated — this should be reported explicitly and may require class-weighting or merging L2/L3 if too sparse.
 
-**Output of Stage 4:** A dataset where each row is:
-```
-[failure signature feature vector] → [minimum repair level label: L1 / L2 / L3 / Unrecoverable]
-```
+### Stage 5: Recoverability Prediction (First Gate)
 
-This dataset is the foundation for Stages 5 and 6.
+- Binary classification: RECOVERABLE vs UNRECOVERABLE
+- Input: failure signature (tabular + PCA-reduced embeddings)
+- Model: **XGBoost** (default, given dataset size)
+- If predicted UNRECOVERABLE → stop immediately, zero repair tokens spent
 
----
+**Metrics:** AUROC (target > 0.75, but with ~150-500 examples report confidence intervals — a point estimate alone is misleading at this N), precision/recall on UNRECOVERABLE, Brier score for calibration.
 
-### Stage 5: Recoverability Prediction (The First Gate)
+### Stage 6: Repair Budget Routing (Second Gate)
 
-- **Task Type:** Binary classification
-- **Input:** The failure signature feature vector (from Stage 3)
-- **Output:** RECOVERABLE or UNRECOVERABLE
-- **Model:** XGBoost Classifier with embedding features concatenated to tabular features
-- **Trained on:** The labeled dataset from Stage 4
-- **Purpose:** Before spending any repair tokens, filter out failures that are fundamentally unrecoverable
+- Ordinal classification: L1 < L2 < L3
+- Input: failure signature of failures predicted RECOVERABLE
+- Model: **XGBoost** with ordinal-aware loss (or, given small-N, an ordinal logistic regression baseline alongside XGBoost — worth comparing both)
+- Why ordinal: predicting L3 when the truth is L1 wastes 2500 tokens; predicting L2 when truth is L1 wastes 1000. A standard multi-class loss treats both errors as equally wrong, which is incorrect here.
 
-If a failure is predicted UNRECOVERABLE, the system immediately stops and reports the problem as unsolvable. Zero repair tokens are spent. Across a large benchmark, this alone saves a significant fraction of total inference cost.
-
-**Evaluation metrics for this classifier:**
-- AUROC (Area Under ROC Curve) — primary metric; target above 0.75
-- Precision and Recall for the UNRECOVERABLE class specifically
-- Brier Score — measures whether the predicted probabilities are well-calibrated (i.e., when the model says 80% confident it's unrecoverable, it should be right ~80% of the time)
+**Metric:** Mean Absolute Level Error (primary), per-class precision/recall, confusion matrix.
 
 ---
 
-### Stage 6: Repair Budget Routing (The Second Gate)
+## Architecture Ablation: XGBoost vs MLP Fusion
 
-- **Task Type:** Ordinal classification (ordered classes: L1 < L2 < L3)
-- **Input:** Failure signature of a failure that passed Stage 5 (predicted RECOVERABLE)
-- **Output:** Predicted repair level — Level 1, Level 2, or Level 3
-- **Model:** XGBoost Classifier with ordinal-aware loss
-- **Purpose:** Route each recoverable failure to the cheapest repair strategy likely to succeed
+Given the dimensionality-reduction step above, the headline pipeline stays XGBoost end-to-end (simpler, interpretable, appropriate for the dataset size). As a **secondary experiment**, add:
 
-**Why ordinal classification and not standard multi-class:**  
-The three budget levels are not unordered categories — they have a natural order (L1 < L2 < L3). In standard multi-class classification, predicting L3 when the correct answer is L1 counts the same as predicting L2 when the correct answer is L1. This is mathematically wrong. Predicting L3 instead of L1 wastes 2500 tokens unnecessarily. Predicting L2 instead of L1 wastes only 1000 tokens. The error metric used is **mean absolute level error**, which penalizes larger mispredictions more heavily than smaller ones.
+- **Variant B:** small 2-layer MLP (e.g. `Linear(tabular_dim + 64, 64) → ReLU → Dropout → Linear(64, num_classes)`) trained on tabular + raw (non-PCA) embeddings, interpreted with `shap.DeepExplainer`
 
-**Evaluation metrics for this classifier:**
-- Mean Absolute Level Error (MAE in ordinal levels) — primary metric
-- Per-class precision and recall
-- Confusion matrix to visualize which levels get confused with which
+Compare Variant B against the XGBoost+PCA pipeline on the same train/test split. This produces a real, reportable finding either way:
+- If XGBoost+PCA matches or beats the MLP → dimensionality reduction was sufficient, simpler pipeline wins
+- If the MLP meaningfully beats XGBoost+PCA → continuous fusion captures something PCA discards, and that's worth a deeper dive
+
+Either outcome is publishable; neither requires committing to the MLP as the primary system before you've seen the data.
 
 ---
 
 ## Baselines
 
-The adaptive policy is compared against five baselines to isolate the value of each component:
-
-| Baseline | What It Does | Why It Is Included |
+| Baseline | What It Does | Why It's Included |
 |---|---|---|
-| **No Repair** | Generate once and stop; spend zero extra tokens | Lower bound — zero compute cost, lowest accuracy |
-| **Always Level 1** | Spend exactly 500 repair tokens on every failure | Tests whether cheap fixed repairs are sufficient |
-| **Always Level 3** | Spend exactly 3000 repair tokens on every failure | Upper bound on cost — best accuracy any fixed strategy can achieve |
-| **Random Routing** | Randomly assign each failure to L1, L2, or L3 | Tests whether the predictor beats random chance |
-| **Oracle Routing** | Always use the true minimum sufficient level (from Stage 4 labels) | Theoretical ceiling — best any router could possibly achieve |
-| **Best-of-N Baseline** | For a given token budget, generate N candidates and pick the first one that passes tests | Tests whether adaptive single-pass routing beats naive parallel sampling |
+| No Repair | Generate once, stop | Lower bound on cost and accuracy |
+| Always Level 1 | 500 tokens on every failure | Tests if cheap fixes are usually enough |
+| Always Level 3 | 3000 tokens on every failure | Upper bound on cost/accuracy for fixed strategies |
+| Random Routing | Randomly assign L1/L2/L3 | Tests if the predictor beats chance |
+| Oracle Routing | Always use the true minimum level (Stage 4 labels) | Theoretical ceiling |
+| Best-of-N | N parallel 500-token attempts, take first pass | Tests adaptive routing vs brute-force sampling |
 
-The Best-of-N baseline is critical: if generating three 500-token repair attempts and picking the passing one beats the adaptive router, then the core claim (that execution feedback can route single-pass compute better than brute-force sampling) is weakened.
+Best-of-N is the most important comparison: if 3 parallel cheap attempts beat the adaptive router, the core claim that *execution feedback enables better single-pass routing than brute-force sampling* is weakened — and that's worth knowing.
 
 ---
 
 ## Evaluation Metrics
 
-| Metric | Definition | What It Answers |
-|---|---|---|
-| **Pass@1** | Percentage of all problems solved (initial generation + repair) | Does the system get the right answer? |
-| **Recovery Rate** | Percentage of failed problems successfully repaired | How effective is the repair system specifically? |
-| **Total Token Cost** | Sum of all tokens consumed across all problems | How expensive is the system? |
-| **Compute-Normalized Accuracy (CNA)** | Pass@1 ÷ Total Tokens Consumed | Primary efficiency metric — accuracy per token |
-| **Inference Latency** | Total wall-clock time for all generation | Real-world speed cost |
-| **Sandbox Execution Overhead** | Wall-clock time spent in the execution sandbox per failure (separate from generation time) | Measures the latency cost of the routing pipeline itself |
-| **Recoverability AUROC** | Area under ROC for the binary recoverability classifier | How well does the system identify hopeless failures? |
-| **Budget Prediction MAE** | Mean absolute error in predicted vs. actual repair level | How close are the routing predictions? |
-| **Brier Score** | Mean squared error of probability calibration | Are the confidence scores trustworthy? |
+| Metric | Definition |
+|---|---|
+| Pass@1 | % of problems solved (generation + repair) |
+| Recovery Rate | % of failures successfully repaired |
+| Total Token Cost | Sum of all tokens across all problems |
+| Compute-Normalized Accuracy (CNA) | Pass@1 ÷ Total Tokens |
+| Inference Latency | Wall-clock generation time |
+| Sandbox Execution Overhead | Wall-clock sandbox time per failure (reported separately) |
+| Recoverability AUROC | Stage 5 classifier performance |
+| Budget Prediction MAE | Stage 6 ordinal error |
+| Brier Score | Probability calibration |
 
-**The primary claim being tested:**
-> The adaptive system achieves similar Pass@1 to Always-Level-3 while consuming 30–50% fewer total tokens, resulting in a higher Compute-Normalized Accuracy.
+**Primary claim being tested:** the adaptive system reaches close to Always-Level-3's Pass@1 while using meaningfully fewer total tokens. Given the small dataset, report this with confidence intervals (e.g. bootstrap over the test set) rather than a single point estimate — at N~100-150 test failures, a "30-50% savings" claim needs an error bar to be credible.
 
 ---
 
 ## Interpretability: SHAP Analysis
 
-SHAP (SHapley Additive exPlanations) is applied to both XGBoost classifiers to produce human-readable explanations of what the models learned.
+Applied to the XGBoost classifiers via `TreeExplainer` (and to the MLP variant via `DeepExplainer`, if built).
 
-SHAP answers:
-- Which features most strongly predict recoverability?
-- Which features most strongly predict repair budget?
-- Do the Qwen model and DeepSeek model produce similar or different SHAP importance rankings?
+**Things to actually check (framed as questions, not pre-confirmed findings):**
+- Does `SyntaxError` cluster toward L1?
+- Does `TimeoutError` cluster toward Unrecoverable/L3?
+- Do AST/cyclomatic complexity correlate with higher repair levels?
+- Does runtime-near-timeout predict algorithmic (expensive) failures?
 
-**Hypothesized SHAP findings (to be empirically confirmed or rejected):**
-- `SyntaxError` exception type → strongly predicts Level 1 (cheap surface fix)
-- `TimeoutError` exception type → strongly predicts Unrecoverable or Level 3 (algorithmic failure)
-- High AST complexity + high cyclomatic complexity → correlates with higher repair budget
-- Runtime very close to the timeout limit → predicts algorithmic failure (expensive or unrecoverable)
-- High traceback depth → correlates with complex logic errors
+These are reasonable hypotheses based on how these exceptions typically behave, but with a few hundred examples some of these may not reach statistical significance — report which ones do and which don't, rather than treating all of them as confirmed.
 
-**Error analysis on mispredictions:**  
-When the recoverability classifier predicts RECOVERABLE but the failure is actually unrecoverable, what do those failures look like? Clustering mispredictions by their failure signature embeddings will reveal failure modes the classifier systematically misses — this is a finding about LLM failure modes, not just a classifier performance number.
-
-**AssertionError-specific ablation (the anticipated hardest case):**  
-`AssertionError` is the most ambiguous exception class in this dataset. It fires whenever the output is simply wrong — which could mean a missing `<` vs `<=` in a comparison (a 50-token Level 1 fix) or a completely wrong dynamic programming recurrence relation (a 3000-token Level 3 rewrite). The tabular feature `exception_type = AssertionError` carries almost no repair cost signal on its own. The ablation study comparing embedding features vs. tabular-only features specifically isolates AssertionError cases to show how much of the classifier's gain on this class comes from reading the actual semantic content of the traceback vs. the exception label alone. This is expected to be where embeddings provide the largest measurable lift.
+**AssertionError ablation:** `AssertionError` (wrong output, right execution) is typically the largest and most ambiguous class — it covers everything from a one-character comparison bug to a wrong DP recurrence. Compare the XGBoost+PCA-embeddings model against a tabular-only model **specifically on AssertionError cases** to see how much the embeddings actually help when the exception label itself is uninformative.
 
 ---
 
 ## DeepSeek-R1 Thinking Token Analysis
 
-A dedicated analysis is run specifically on DeepSeek-R1's outputs:
+For DeepSeek-R1 outputs:
+1. Parse `<think>...</think>` separately from code tokens
+2. Record thinking tokens, coding tokens, total tokens per failure
+3. Train a small secondary regressor: failure signature → thinking budget needed vs coding budget needed
+4. SHAP on this regressor to see which failure types drive heavy thinking vs light thinking
 
-1. Parse every DeepSeek output to separate `<think>` tokens from actual Python code tokens
-2. For each failure, record: thinking token count, coding token count, total token count
-3. Train a secondary predictor: given the failure signature, predict the thinking budget required vs. the coding budget required separately
-4. Show via SHAP analysis which failure types correlate with heavy thinking requirements vs. light thinking requirements
-
-**Expected finding:** Failures involving complex algorithmic reasoning (TimeoutError, wrong output on large inputs) will require massive thinking budgets but moderate coding budgets. Simple failures (SyntaxError, NameError) will require near-zero thinking tokens since the fix is obvious. This would be an empirically novel finding about how reasoning models internally allocate computation across failure types.
+**Reasonable expectation, to be checked:** algorithmically complex failures (TimeoutError, large-input wrong-output) lean on thinking tokens more; trivial failures (SyntaxError, NameError) need minimal thinking. Worth checking whether this holds, and reporting honestly if it doesn't — a null result here is still informative about how these models allocate reasoning.
 
 ---
 
 ## Generalization Experiments
 
 ### Cross-Model Transfer
-- Train XGBoost classifiers on failures from Qwen2.5-Coder-7B
-- Test the same classifiers on failures from DeepSeek-R1-Distill-Qwen-7B (no retraining)
-- **Question:** Do failure signatures generalize across model architectures, or is the failure-to-repair-cost relationship model-specific?
+Train on Qwen failures, test (no retraining) on DeepSeek failures. Question: does the failure→repair-cost mapping transfer across architectures, or is it model-specific? With ~150-500 examples per model, treat this as a directional/preliminary result, not a strong claim.
 
 ### Cross-Difficulty Transfer
-- Train on failures from Easy and Medium LiveCodeBench problems
-- Test on failures from Hard LiveCodeBench problems
-- **Question:** Does the failure-to-repair-cost mapping remain stable as problem difficulty increases, or does it break down on harder problems?
+Train on Easy/Medium, test on Hard. Question: does the mapping hold as difficulty increases?
 
 ---
 
 ## What Success Looks Like
 
-The project is successful if:
-- The adaptive router achieves within 2–3% of the Pass@1 of Always-Level-3
-- The adaptive router consumes 30–50% fewer total tokens than Always-Level-3
-- The Compute-Normalized Accuracy of the adaptive system exceeds all fixed-budget baselines
-- The Recoverability classifier achieves AUROC above 0.75
-- SHAP analysis reveals at least 2–3 features with clear, interpretable predictive relationships
-- The DeepSeek-R1 thinking token analysis reveals a meaningful pattern between failure type and thinking budget
+- Adaptive router gets within a few percentage points of Always-Level-3's Pass@1 (with confidence interval)
+- Adaptive router uses meaningfully fewer total tokens than Always-Level-3
+- CNA of the adaptive system beats fixed-budget baselines
+- Recoverability AUROC clears 0.75 (with CI reported given small N)
+- At least a couple of SHAP relationships hold up and are interpretable
+- DeepSeek thinking-token analysis shows *some* pattern — even a weak or null one is reportable
 
 ---
 
-## What Failure Looks Like (and Why It Is Still Valuable)
+## What Failure Looks Like (and Why It's Still Valuable)
 
-Even if the predictions are poor, the project produces independent scientific value:
-- The dataset (failure signatures mapped to repair costs) is novel and reusable by other researchers
-- The recoverability analysis reveals what fraction of LLM coding failures are fundamentally unrecoverable — a finding with independent value regardless of classifier performance
-- Null results inform the field about the limits of execution feedback as a predictive signal
+Even with poor predictive performance:
+- The labeled failure→repair-cost dataset is novel and reusable
+- The recoverability breakdown tells you what fraction of LLM coding failures are fundamentally unrecoverable under zero-shot feedback — independently interesting
+- A null result on the embedding ablation tells the field something about the limits of execution feedback as a signal
 
 ---
 
 ## Known Limitations
 
-| Limitation | How It Is Handled |
+| Limitation | How It's Handled |
 |---|---|
-| Hard token cap may truncate reasoning mid-thought (especially DeepSeek-R1) | Tracked explicitly via `<think>` token parsing; reported as a finding |
-| Fixed single repair attempt per budget level (no retries) | Acknowledged scope limitation; future work adds Best-of-N within budget |
-| Two models may not generalize beyond Qwen-family architectures | Framed as preliminary generalization study, not a strong universal claim |
-| LiveCodeBench is competitive programming — failure patterns may differ in real software engineering tasks | Acknowledged explicitly; SWE-bench generalization is future work |
-| XGBoost may miss non-linear semantic interactions that embeddings capture | Embedding features are included; ablation study compares embedding vs. tabular-only |
-| Benchmark distribution may shift over time | Benchmark version pinned via commit hash for full reproducibility |
-| The full routing pipeline adds wall-clock latency overhead (sandbox execution + embedding forward pass + XGBoost inference) on top of generation time | Sandbox latency is measured and reported separately alongside token counts; the paper acknowledges that token savings must be weighed against execution overhead in latency-sensitive production deployments. In practice, XGBoost inference is microseconds and the embedding step is a single frozen forward pass — the dominant overhead is the sandbox execution itself, which is unavoidable in any execution-guided system. |
+| Small dataset (~150-500 failures per model) | Dimensionality reduction on embeddings; confidence intervals on all headline metrics; class-imbalance handling for L2/L3 |
+| Hard token caps may truncate DeepSeek-R1 mid-reasoning | Tracked via `<think>` token parsing; reported as a finding |
+| Single repair attempt per budget level (no retries) | Stated scope limitation; Best-of-N is a separate baseline, not combined with routing |
+| Two models may not generalize beyond Qwen-family architectures | Framed as preliminary, not a universal claim |
+| LiveCodeBench is competitive programming, not general SWE | Acknowledged; SWE-bench generalization is future work |
+| Raw embeddings + small N would overfit either XGBoost or an MLP | PCA/UMAP reduction applied before fusion; ablation compares reduced-XGBoost vs raw-MLP |
+| Sandbox execution adds wall-clock overhead | Measured and reported separately from token costs |
+| Benchmark distribution may shift over time | Version pinned via commit hash |
 
 ---
 
 ## Output Deliverables
 
-At the end of the project, the following exist:
-
-1. **A labeled dataset** — failure signatures from two LLMs on LiveCodeBench, each labeled with the minimum repair budget level that succeeded (or Unrecoverable)
-2. **Two trained XGBoost classifiers** — the recoverability predictor and the budget router, with saved weights and hyperparameters
-3. **SHAP analysis outputs** — feature importance plots, summary plots, and misprediction cluster analysis
-4. **DeepSeek-R1 thinking token breakdown** — per-failure analysis of thinking vs. coding token allocation
-5. **Generalization experiment results** — cross-model and cross-difficulty transfer performance tables
-6. **A Pareto frontier visualization** — plotting Pass@1 vs. Total Tokens for the adaptive router, all fixed baselines, and the oracle, showing the efficiency frontier
-7. **A research paper** describing the full experimental setup, results, findings, and limitations
+1. A labeled dataset: failure signatures from two LLMs on a pinned LiveCodeBench version, each with a minimum-repair-level label (or Unrecoverable)
+2. Two trained XGBoost classifiers (recoverability, budget routing) with saved weights/hyperparameters, plus the MLP comparison variant if built
+3. SHAP outputs: feature importance plots, AssertionError ablation, misprediction cluster analysis
+4. DeepSeek-R1 thinking-vs-coding token breakdown
+5. Cross-model and cross-difficulty transfer results
+6. Pareto frontier plot: Pass@1 vs Total Tokens for adaptive router, fixed baselines, and oracle
+7. A writeup describing setup, results (with confidence intervals), and limitations — including an honest pilot-study section reporting the actual failure counts and class distribution observed
 
 ---
 
-## Summary in Plain Terms
+## Plain-Language Summary
 
-Run two language models on hundreds of hard coding problems. Record every single failure in detail. For each failure, try to repair it at three increasing token budgets, finding the cheapest one that works. Use those labels to train two classifiers: one that predicts whether a failure is even fixable, and one that predicts how many tokens the fix needs. Deploy this system so it only spends what is needed per failure — cheap fixes get cheap budgets, expensive fixes get expensive budgets, and hopeless failures get nothing. Compare this to always spending the maximum budget, and show that the same accuracy is achievable at a fraction of the cost. Analyze what the classifiers learned to explain *why* certain failures are cheap or expensive to fix.
+Run two language models on a pinned set of hard coding problems. Record every failure in detail. For each failure, try repairing it at three increasing token budgets and find the cheapest one that works. Reduce the dimensionality of code/traceback embeddings so they can be combined with simple tabular features without overfitting a small dataset. Train two small classifiers — one predicting whether a failure is fixable at all, one predicting how many tokens a fix needs — primarily with XGBoost, with a small MLP comparison as a secondary check. Deploy this so the system spends only what's needed per failure. Compare against always spending the maximum, report results with honest uncertainty given the dataset size, and use SHAP to explain what the classifiers learned.
